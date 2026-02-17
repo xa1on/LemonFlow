@@ -10,9 +10,10 @@ from openai import OpenAI
 
 BASE_URL = "http://localhost:8000/api/v1"
 SAMPLE_RATE = 16000
-DEFAULT_MODEL = "Whisper-Tiny"
-VAD_THRESHOLD = 0.02
-SILENCE_DURATION = 2
+DEFAULT_MODEL = "Whisper-Base"
+VAD_START_THRESHOLD = 0.02
+VAD_SILENCE_THRESHOLD = 0.005
+SILENCE_DURATION = 1
 MIN_RECORDING_LEN = 0.5
 
 class LemonFlow:
@@ -36,7 +37,8 @@ class LemonFlow:
         try:
             transcript = self.client.audio.transcriptions.create(
                 model=model,
-                file=byte_io
+                file=byte_io,
+                temperature=0.5
             )
             return transcript.text
         except Exception as e:
@@ -54,7 +56,7 @@ class LemonFlow:
         self.audio_queue.put(indata.copy())
     
     def _process_loop(self, callback, model):
-        print(f"Listening... (Threshold: {VAD_THRESHOLD})")
+        print(f"Listening...")
         recording_buffer = []
         is_recording = False
         silence_start_time = None
@@ -67,7 +69,7 @@ class LemonFlow:
                     continue
                 volume = np.linalg.norm(indata) / np.sqrt(len(indata))
                 
-                if volume > VAD_THRESHOLD:
+                if (not is_recording and volume > VAD_START_THRESHOLD) or (is_recording and volume > VAD_SILENCE_THRESHOLD):
                     if not is_recording:
                         print("Voice detected")
                         is_recording = True
