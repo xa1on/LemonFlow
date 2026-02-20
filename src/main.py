@@ -1,215 +1,196 @@
-"""
-LemonFlow
-
-live speech to text recording and transcription via lemonade and whisper.cpp
-
-Authors: Chenghao Li
-Org: OCF (i guess)
-"""
-
-
-import io
 import time
 import queue
 import threading
+import asyncio
+import base64
+import json
+import urllib.request
 import numpy as np
 import sounddevice as sd
-import scipy.io.wavfile as wav
-from io import BytesIO
-from openai import OpenAI
+from openai import AsyncOpenAI
 
 BASE_URL = "http://localhost:8000/api/v1"
-SAMPLE_RATE = 16000 # recording sample rate (samples/sec) default: 16000 (whisper.cpp)
-
-DEFAULT_MODEL = "Whisper-Base" # stt model
-VAD_START_THRESHOLD = 0.02 # threshold required to start recording
-VAD_SILENCE_THRESHOLD = 0.005 # threshold required to continue a recording (dont stop recording prematurely)
-SILENCE_DURATION = 1 # length in seconds of silence before stopping recording 
-MIN_RECORDING_LEN = 0.3 # minimum length of recording in seconds
-TEMPERATURE = 0.5 # transcription model temp
-
+SAMPLE_RATE = 16000 
+DEFAULT_MODEL = "Whisper-Tiny" 
 
 class LemonFlow:
     """
-    live speech to text recording and transcription via lemonade and whisper.cpp
+    live speech to text via lemonade realtime api
+    streams audio and fires callback on every text delta
 
     :param self:
     :param model: speech to text model name
-    :param temperature: speech to text model
     :param sample_rate: audio sample rate
-    :param base_url: openai api base url to connect to lemonade
+    :param base_url: lemonade api base url
     """
 
-    def __init__(self, model: str=DEFAULT_MODEL, temperature: float=TEMPERATURE, sample_rate: int=SAMPLE_RATE, base_url=BASE_URL):
+    def __init__(self, model: str=DEFAULT_MODEL, sample_rate: int=SAMPLE_RATE, base_url=BASE_URL):
         self.model = model
-        self.temperature = temperature
         self.sample_rate = sample_rate
-        self.client = OpenAI(base_url=base_url, api_key="lemonflow")
+        self.base_url = base_url
         self.audio_queue = queue.Queue()
         self.is_running = False
         self.processing_thread = None
 
-    def _save_audio(self, inp_audio) -> BytesIO:
+    def _get_ws_port(self) -> str:
         """
-        writes audio into memory to be transcribed
-        
-        :param self:
-        :param inp_audio: input audio
-        :return: saved audio in memory
-        """
-        byte_io = io.BytesIO()
-        audio_int16 = (inp_audio * 32767).astype(np.int16)
-        wav.write(byte_io, self.sample_rate, audio_int16)
-        
-        byte_io.seek(0)
-        byte_io.name = f"chunk{str(time.time())}.wav"
-        return byte_io
-    
-    def _transcribe_io(self, byte_io: BytesIO) -> str:
-        """
-        trascribe audio saved in memory via openai api
-        
-        :param self:
-        :param byte_io: stored audio
-        :return: resulting transcription
+        fetches dynamic websocket port from lemonade health endpoint
         """
         try:
-            transcript = self.client.audio.transcriptions.create(
-                model=self.model,
-                file=byte_io,
-                temperature=self.temperature
-            )
-            return transcript.text
+            with urllib.request.urlopen(f"{self.base_url}/health", timeout=5) as resp:
+                data = json.loads(resp.read().decode())
+                return data.get("websocket_port")
         except Exception as e:
-            print(f"Error during transcription: {e}")
-            return ""
-    
-    def _transcribe_worker(self, audio_data, callback) -> None:
+            print(f"error getting port: {e}")
+            return None
+
+    def _ensure_model_loaded(self) -> None:
         """
-        transcribes audio data, then runs callback with result
-        
-        :param self:
-        :param audio_data: raw audio data
-        :param callback: function to call with resulting transcription
+        ensures model is loaded via rest api
         """
-        text = self._transcribe_io(self._save_audio(audio_data), self.model)
-        if text:
-            callback(text)
+        try:
+            req = urllib.request.Request(
+                f"{self.base_url}/load",
+                data=json.dumps({"model_name": self.model}).encode(),
+                headers={"Content-Type": "application/json"}
+            )
+            with urllib.request.urlopen(req, timeout=60):
+                pass
+        except Exception:
+            pass
 
     def _audio_callback(self, indata, frames, time_info, status) -> None:
         """
-        stores input data from audio stream into queue for processing
-        
-        :param self:
-        :param indata: input data from stream
-        :param frames:
-        :param time_info:
-        :param status: audio status
+        sounddevice callback to fill queue
         """
         if status:
-            print(f"Audio Status: {status}")
+            print(f"status: {status}")
         self.audio_queue.put(indata.copy())
-    
+
+    async def _realtime_worker(self, callback):
+        """
+        async worker using openai sdk to stream audio and events
+        """
+        self._ensure_model_loaded()
+        ws_port = self._get_ws_port()
+        
+        if not ws_port:
+            print("server not healthy or port not found")
+            return
+
+        client = AsyncOpenAI(
+            api_key="unused",
+            base_url=self.base_url,
+            websocket_base_url=f"ws://localhost:{ws_port}"
+        )
+
+        print("connecting...")
+        
+        try:
+            async with client.beta.realtime.connect(model=self.model) as conn:
+                # wait for session created event
+                await asyncio.wait_for(conn.recv(), timeout=10)
+                print("listening...")
+
+                async def send_audio():
+                    while self.is_running:
+                        try:
+                            # get audio from queue
+                            indata = self.audio_queue.get_nowait()
+                            
+                            # convert to pcm16
+                            audio_int16 = (indata * 32767).astype(np.int16)
+                            pcm_bytes = audio_int16.tobytes()
+                            
+                            # send to buffer
+                            await conn.input_audio_buffer.append(
+                                audio=base64.b64encode(pcm_bytes).decode("utf-8")
+                            )
+                            await asyncio.sleep(0) 
+                        except queue.Empty:
+                            await asyncio.sleep(0.01)
+                        except Exception as e:
+                            print(f"send error: {e}")
+                            break
+
+                async def receive_transcripts():
+                    async for event in conn:
+                        if not self.is_running:
+                            break
+                        print(event)
+                        # handle partial text updates immediately
+                        if event.type == "response.audio_transcript.delta":
+                            if hasattr(event, 'delta') and event.delta:
+                                callback(event.delta)
+                                
+                        # compatibility for older lemonade versions
+                        elif event.type == "conversation.item.input_audio_transcription.delta":
+                            if hasattr(event, 'delta') and event.delta:
+                                callback(event.delta)
+
+                await asyncio.gather(send_audio(), receive_transcripts())
+
+        except Exception as e:
+            print(f"connection error: {e}")
+
     def _process_loop(self, callback) -> None:
         """
-        main processing loop for audio listening and recording -> transcription
-        
-        :param self:
-        :param callback: callback function for resulting transcriptions
+        runs the async loop in a separate thread
         """
-        print(f"Listening...")
-        recording_buffer = []
-        is_recording = False
-        silence_start_time = None
+        try:
+            asyncio.run(self._realtime_worker(callback))
+        except Exception as e:
+            print(f"loop error: {e}")
 
-        with sd.InputStream(samplerate=self.sample_rate, channels=1, callback=self._audio_callback):
-            while self.is_running:
-                try:
-                    indata = self.audio_queue.get(timeout=0.5)
-                except queue.Empty:
-                    continue
-                volume = np.linalg.norm(indata) / np.sqrt(len(indata))
-                
-                # use start threshold when not recording and silence threshold when recording
-                if (not is_recording and volume > VAD_START_THRESHOLD) or (is_recording and volume > VAD_SILENCE_THRESHOLD):
-                    if not is_recording:
-                        print("Voice detected")
-                        is_recording = True
-                    silence_start_time = None
-                    recording_buffer.append(indata)
-                
-                elif is_recording:
-                    recording_buffer.append(indata) 
-                    
-                    if silence_start_time is None:
-                        silence_start_time = time.time()
-                    
-                    elif (time.time() - silence_start_time) > SILENCE_DURATION:
-                        if len(recording_buffer) > 0:
-                            full_audio = np.concatenate(recording_buffer, axis=0)
-                            duration = len(full_audio) / self.sample_rate
-                            
-                            if duration >= MIN_RECORDING_LEN:
-                                print("Transcribing", end="\r", flush=True)
-                                t = threading.Thread(
-                                    target=self._transcribe_worker, 
-                                    args=(full_audio, callback),
-                                    daemon=True
-                                )
-                                t.start()
-                        
-                        # clear buffers
-                        recording_buffer = []
-                        is_recording = False
-                        silence_start_time = None
-
-    def start_listening(self, callback, model: str|None, temperature: float|None) -> None:
+    def start_listening(self, callback, model: str|None=None) -> None:
         """
-        start listening via microphone
-        
-        :param self:
-        :param callback: callback function for resulting transcriptions
-        :param model: speech to text model name
-        :param temperature: speech to text model temperature
+        starts audio stream and background processing
         """
-        if model != None:
+        if model:
             self.model = model
-        if temperature != None:
-            self.temperature = temperature
         
         if self.is_running:
-            print("Already running.")
+            print("already running")
             return
         self.is_running = True
         
         with self.audio_queue.mutex:
             self.audio_queue.queue.clear()
 
+        # start audio stream
+        self.stream = sd.InputStream(
+            samplerate=self.sample_rate, 
+            channels=1, 
+            callback=self._audio_callback,
+            blocksize=4096
+        )
+        self.stream.start()
+
         self.processing_thread = threading.Thread(
             target=self._process_loop, 
-            args=(callback, model),
+            args=(callback,),
             daemon=True
         )
         self.processing_thread.start()
     
     def stop_listening(self) -> None:
         """
-        ends listening and transcription
-        
-        :param self:
+        stops stream and thread
         """
         self.is_running = False
+        if hasattr(self, 'stream'):
+            self.stream.stop()
+            self.stream.close()
         if self.processing_thread:
             self.processing_thread.join()
-        print("Stopped listening.")
+        print("\nstopped listening")
 
 def main():
-    # example code of streaming transcription
     lemon = LemonFlow()
     
     def on_text_received(text: str) -> None:
-        print(f"\nOutput: {text}")
-        print("Listening...", end="\r", flush=True)
+        # print chunks as they arrive without newlines
+        pass # print(text, end="", flush=True)
         
     try:
         lemon.start_listening(callback=on_text_received)
