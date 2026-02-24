@@ -1,4 +1,4 @@
-sounddevice
 numpy
 scikit-learn
 openai
+pyaudio

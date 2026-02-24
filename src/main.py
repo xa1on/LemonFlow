@@ -1,4 +1,7 @@
+import os
 import time
+import struct
+import logging
 import queue
 import threading
 import asyncio
@@ -6,12 +9,38 @@ import base64
 import json
 import urllib.request
 import numpy as np
-import sounddevice as sd
+import pyaudio
 from openai import AsyncOpenAI
 
 BASE_URL = "http://localhost:8000/api/v1"
-SAMPLE_RATE = 16000 
-DEFAULT_MODEL = "Whisper-Tiny" 
+SAMPLE_RATE = 16000
+CHUNK_SIZE = 4096
+DEFAULT_MODEL = "Whisper-Tiny"
+
+logger = logging.getLogger("lemonflow")
+logging.basicConfig(level=logging.INFO)
+
+def downsample_pcm16(pcm16_bytes, native_rate, target_rate):
+    """
+    downsample pcm16 from native rate to target rate
+
+    :param pcm16_bytes: raw pcm16 data
+    :param native_rate: original rate
+    :param target_rate: new rate
+    """
+    if native_rate == target_rate:
+        return pcm16_bytes
+    n_samples = len(pcm16_bytes) // 2
+    samples = struct.unpack(f'<{n_samples}h', pcm16_bytes)
+    ratio = native_rate / target_rate
+    output_length = int(n_samples / ratio)
+    output = bytearray(output_length * 2)
+    for i in range(output_length):
+        src_idx = i * ratio
+        idx_floor = int(src_idx)
+        frac = src_idx - idx_floor
+        struct.pack_into('<h', output, i * 2, max(-32768, min(32767, int(samples[idx_floor] * (1 - frac) + samples[min(idx_floor + 1, n_samples - 1)] * frac))))
+    return bytes(output)
 
 class LemonFlow:
     """
@@ -24,176 +53,170 @@ class LemonFlow:
     :param base_url: lemonade api base url
     """
 
-    def __init__(self, model: str=DEFAULT_MODEL, sample_rate: int=SAMPLE_RATE, base_url=BASE_URL):
+    def __init__(self, model: str=DEFAULT_MODEL, sample_rate: int=SAMPLE_RATE, chunk_size: int=CHUNK_SIZE, base_url=BASE_URL):
         self.model = model
         self.sample_rate = sample_rate
+        self.chunk_size = chunk_size
         self.base_url = base_url
-        self.audio_queue = queue.Queue()
-        self.is_running = False
-        self.processing_thread = None
+        self.is_listening = False
+        self._load_model()
 
-    def _get_ws_port(self) -> str:
-        """
-        fetches dynamic websocket port from lemonade health endpoint
-        """
-        try:
-            with urllib.request.urlopen(f"{self.base_url}/health", timeout=5) as resp:
-                data = json.loads(resp.read().decode())
-                return data.get("websocket_port")
-        except Exception as e:
-            print(f"error getting port: {e}")
-            return None
-
-    def _ensure_model_loaded(self) -> None:
-        """
-        ensures model is loaded via rest api
-        """
+    def _load_model(self) -> None:
         try:
             req = urllib.request.Request(
                 f"{self.base_url}/load",
                 data=json.dumps({"model_name": self.model}).encode(),
                 headers={"Content-Type": "application/json"}
             )
-            with urllib.request.urlopen(req, timeout=60):
-                pass
-        except Exception:
-            pass
-
-    def _audio_callback(self, indata, frames, time_info, status) -> None:
-        """
-        sounddevice callback to fill queue
-        """
-        if status:
-            print(f"status: {status}")
-        self.audio_queue.put(indata.copy())
-
-    async def _realtime_worker(self, callback):
-        """
-        async worker using openai sdk to stream audio and events
-        """
-        self._ensure_model_loaded()
-        ws_port = self._get_ws_port()
+            with urllib.request.urlopen(req, timeout=120) as _:
+                logger.info(f"model loaded: {self.model}")
+        except Exception as e:
+            logger.error(f"error loading model: {e}")
+            return
         
-        if not ws_port:
-            print("server not healthy or port not found")
+    def _get_ws_port(self) -> None | int:
+        try:
+            with urllib.request.urlopen(f"{self.base_url}/health", timeout=10) as resp:
+                health = json.loads(resp.read().decode())
+                ws_port = health.get("websocket_port")
+                if not ws_port:
+                    logger.error("server did not provide health")
+                    return
+                logger.info(f"found websocket port: {ws_port}")
+                return ws_port
+        except Exception as e:
+            logger.error(f"error fetching websocket: {e}")
             return
 
+    async def _realtime_connection(self, client: AsyncOpenAI, delta_callback: callable, transcript_callback: callable):
+        logger.info("connecting...")
+
+        async with client.beta.realtime.connect(model=self.model) as conn:
+            event = await asyncio.wait_for(conn.recv(), timeout=15)
+            logger.info(f"session {event.session.id}")
+            self.is_listening = True
+
+            transcription_complete = asyncio.Event()
+
+            pa = pyaudio.PyAudio()
+            device_info = pa.get_default_input_device_info()
+            native_rate = int(device_info['defaultSampleRate'])
+            
+            stream = pa.open(
+                format=pyaudio.paInt16,
+                channels=1,
+                rate=native_rate,
+                input=True,
+                frames_per_buffer=CHUNK_SIZE
+            )
+            
+            logger.info("recording...")
+
+            async def send_audio():
+                try:
+                    while self.is_listening:
+                        data = await asyncio.to_thread(stream.read, CHUNK_SIZE, exception_on_overflow=False)
+                        data = downsample_pcm16(data, native_rate, self.sample_rate)
+                        
+                        await conn.input_audio_buffer.append(
+                            audio=base64.b64encode(data).decode()
+                        )
+                        await asyncio.sleep(0.01)
+                    
+                    logger.info("committing final audio...")
+                    await conn.input_audio_buffer.commit()
+
+                except asyncio.CancelledError:
+                    logger.info("committing final audio...")
+                    await conn.input_audio_buffer.commit()
+                    self.is_listening = False
+                    pass
+            
+            async def receive_transcriptions():
+                try:
+                    async for event in conn:
+                        if event.type == "conversation.item.input_audio_transcription.delta":
+                            print(event)
+                            delta_callback(getattr(event, "delta", "").replace('\n', ' ').strip())
+                        
+                        elif event.type == "conversation.item.input_audio_transcription.completed":
+                            transcript_callback(getattr(event, "transcript", "").replace('\n', ' ').strip())
+                            if not self.is_listening:
+                                transcription_complete.set()
+                        
+                        elif event.type == "error":
+                            error = getattr(event, "error", None)
+                            msg = getattr(error, "message", "Unknown") if error else "Unknown"
+                            logger.error(f"\nerror: {msg}")
+
+                except asyncio.CancelledError:
+                    pass
+
+            send_task = asyncio.create_task(send_audio())
+            receive_task = asyncio.create_task(receive_transcriptions())
+
+            await send_task
+            logger.info("received stop signal...")
+            send_task.cancel()
+            try:
+                await asyncio.wait_for(transcription_complete.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                logger.warning("final transcript never finished.")
+
+            receive_task.cancel()
+            
+
+
+            if stream.is_active():
+                stream.stop_stream()
+            stream.close()
+            pa.terminate()
+            logger.info("ended stream")
+
+            
+
+
+    def start_listening(self, delta_callback: callable, transcript_callback: callable) -> None:
+        """
+        starts audio stream
+        """
+        if self.is_listening:
+            logger.warning("already listening.")
+            return
+        ws_port = self._get_ws_port()
         client = AsyncOpenAI(
-            api_key="unused",
+            api_key="lemonflow",
             base_url=self.base_url,
             websocket_base_url=f"ws://localhost:{ws_port}"
         )
+        self.is_listening = True
+        logger.info("started listening.")
+        asyncio.run(self._realtime_connection(client, delta_callback, transcript_callback))
 
-        print("connecting...")
-        
-        try:
-            async with client.beta.realtime.connect(model=self.model) as conn:
-                # wait for session created event
-                await asyncio.wait_for(conn.recv(), timeout=10)
-                print("listening...")
-
-                async def send_audio():
-                    while self.is_running:
-                        try:
-                            # get audio from queue
-                            indata = self.audio_queue.get_nowait()
-                            
-                            # convert to pcm16
-                            audio_int16 = (indata * 32767).astype(np.int16)
-                            pcm_bytes = audio_int16.tobytes()
-                            
-                            # send to buffer
-                            await conn.input_audio_buffer.append(
-                                audio=base64.b64encode(pcm_bytes).decode("utf-8")
-                            )
-                            await asyncio.sleep(0) 
-                        except queue.Empty:
-                            await asyncio.sleep(0.01)
-                        except Exception as e:
-                            print(f"send error: {e}")
-                            break
-
-                async def receive_transcripts():
-                    async for event in conn:
-                        if not self.is_running:
-                            break
-                        print(event)
-                        # handle partial text updates immediately
-                        if event.type == "response.audio_transcript.delta":
-                            if hasattr(event, 'delta') and event.delta:
-                                callback(event.delta)
-                                
-                        # compatibility for older lemonade versions
-                        elif event.type == "conversation.item.input_audio_transcription.delta":
-                            if hasattr(event, 'delta') and event.delta:
-                                callback(event.delta)
-
-                await asyncio.gather(send_audio(), receive_transcripts())
-
-        except Exception as e:
-            print(f"connection error: {e}")
-
-    def _process_loop(self, callback) -> None:
-        """
-        runs the async loop in a separate thread
-        """
-        try:
-            asyncio.run(self._realtime_worker(callback))
-        except Exception as e:
-            print(f"loop error: {e}")
-
-    def start_listening(self, callback, model: str|None=None) -> None:
-        """
-        starts audio stream and background processing
-        """
-        if model:
-            self.model = model
-        
-        if self.is_running:
-            print("already running")
-            return
-        self.is_running = True
-        
-        with self.audio_queue.mutex:
-            self.audio_queue.queue.clear()
-
-        # start audio stream
-        self.stream = sd.InputStream(
-            samplerate=self.sample_rate, 
-            channels=1, 
-            callback=self._audio_callback,
-            blocksize=4096
-        )
-        self.stream.start()
-
-        self.processing_thread = threading.Thread(
-            target=self._process_loop, 
-            args=(callback,),
-            daemon=True
-        )
-        self.processing_thread.start()
     
     def stop_listening(self) -> None:
         """
-        stops stream and thread
+        stops stream
         """
-        self.is_running = False
-        if hasattr(self, 'stream'):
-            self.stream.stop()
-            self.stream.close()
-        if self.processing_thread:
-            self.processing_thread.join()
-        print("\nstopped listening")
+        if not self.is_listening:
+            logger.warning("not currently listening.")
+            return
+        logger.info("stopping...")
+        self.is_listening = False
+        
+        
 
 def main():
     lemon = LemonFlow()
     
     def on_text_received(text: str) -> None:
-        # print chunks as they arrive without newlines
-        pass # print(text, end="", flush=True)
-        
+        print(text)
+    
+    def on_transcript_received(text: str) -> None:
+        print(f"\n---\n{text}\n---\n\n")
+
     try:
-        lemon.start_listening(callback=on_text_received)
+        lemon.start_listening(delta_callback=on_text_received, transcript_callback=on_transcript_received)
         while True:
             time.sleep(0.1)
 
