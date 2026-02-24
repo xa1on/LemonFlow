@@ -1,9 +1,4 @@
-import os
-import time
-import struct
 import logging
-import queue
-import threading
 import asyncio
 import base64
 import json
@@ -20,7 +15,7 @@ DEFAULT_MODEL = "Whisper-Tiny"
 logger = logging.getLogger("lemonflow")
 logging.basicConfig(level=logging.INFO)
 
-def downsample_pcm16(pcm16_bytes, native_rate, target_rate):
+def downsample_pcm16(pcm16_bytes: bytes, native_rate: int, target_rate: int) -> bytes:
     """
     downsample pcm16 from native rate to target rate
 
@@ -30,17 +25,18 @@ def downsample_pcm16(pcm16_bytes, native_rate, target_rate):
     """
     if native_rate == target_rate:
         return pcm16_bytes
-    n_samples = len(pcm16_bytes) // 2
-    samples = struct.unpack(f'<{n_samples}h', pcm16_bytes)
-    ratio = native_rate / target_rate
-    output_length = int(n_samples / ratio)
-    output = bytearray(output_length * 2)
-    for i in range(output_length):
-        src_idx = i * ratio
-        idx_floor = int(src_idx)
-        frac = src_idx - idx_floor
-        struct.pack_into('<h', output, i * 2, max(-32768, min(32767, int(samples[idx_floor] * (1 - frac) + samples[min(idx_floor + 1, n_samples - 1)] * frac))))
-    return bytes(output)
+    
+    audio_data = np.frombuffer(pcm16_bytes, dtype=np.int16)
+    num_samples = len(audio_data)
+    new_num_samples = int(num_samples * target_rate / native_rate)
+    
+    resampled_audio = np.interp(
+        np.linspace(0, num_samples, new_num_samples, endpoint=False),
+        np.arange(num_samples),
+        audio_data
+    ).astype(np.int16)
+    
+    return resampled_audio.tobytes()
 
 class LemonFlow:
     """
@@ -72,21 +68,20 @@ class LemonFlow:
                 logger.info(f"model loaded: {self.model}")
         except Exception as e:
             logger.error(f"error loading model: {e}")
-            return
         
-    def _get_ws_port(self) -> None | int:
+    def _get_ws_port(self) -> int | None:
         try:
             with urllib.request.urlopen(f"{self.base_url}/health", timeout=10) as resp:
                 health = json.loads(resp.read().decode())
                 ws_port = health.get("websocket_port")
                 if not ws_port:
                     logger.error("server did not provide health")
-                    return
+                    return None
                 logger.info(f"found websocket port: {ws_port}")
                 return ws_port
         except Exception as e:
             logger.error(f"error fetching websocket: {e}")
-            return
+            return None
 
     async def _realtime_connection(self, client: AsyncOpenAI, delta_callback: callable, transcript_callback: callable):
         logger.info("connecting...")
@@ -97,6 +92,7 @@ class LemonFlow:
             self.is_listening = True
 
             transcription_complete = asyncio.Event()
+            last_event_type = None
 
             pa = pyaudio.PyAudio()
             device_info = pa.get_default_input_device_info()
@@ -107,7 +103,7 @@ class LemonFlow:
                 channels=1,
                 rate=native_rate,
                 input=True,
-                frames_per_buffer=CHUNK_SIZE
+                frames_per_buffer=self.chunk_size
             )
             
             logger.info("recording...")
@@ -115,28 +111,30 @@ class LemonFlow:
             async def send_audio():
                 try:
                     while self.is_listening:
-                        data = await asyncio.to_thread(stream.read, CHUNK_SIZE, exception_on_overflow=False)
+                        data = await asyncio.to_thread(stream.read, self.chunk_size, exception_on_overflow=False)
                         data = downsample_pcm16(data, native_rate, self.sample_rate)
                         
                         await conn.input_audio_buffer.append(
                             audio=base64.b64encode(data).decode()
                         )
                         await asyncio.sleep(0.01)
-                    
-                    logger.info("committing final audio...")
-                    await conn.input_audio_buffer.commit()
-
                 except asyncio.CancelledError:
-                    logger.info("committing final audio...")
-                    await conn.input_audio_buffer.commit()
-                    self.is_listening = False
                     pass
+                finally:
+                    if last_event_type != "conversation.item.input_audio_transcription.completed":
+                        logger.info("committing final audio...")
+                        try:
+                            await conn.input_audio_buffer.commit()
+                        except:
+                            pass
+                    self.is_listening = False
             
             async def receive_transcriptions():
+                nonlocal last_event_type
                 try:
                     async for event in conn:
+                        last_event_type = event.type
                         if event.type == "conversation.item.input_audio_transcription.delta":
-                            print(event)
                             delta_callback(getattr(event, "delta", "").replace('\n', ' ').strip())
                         
                         elif event.type == "conversation.item.input_audio_transcription.completed":
@@ -158,23 +156,22 @@ class LemonFlow:
             await send_task
             logger.info("received stop signal...")
             send_task.cancel()
-            try:
-                await asyncio.wait_for(transcription_complete.wait(), timeout=5.0)
-            except asyncio.TimeoutError:
-                logger.warning("final transcript never finished.")
+
+            if last_event_type != "conversation.item.input_audio_transcription.completed":
+                try:
+                    await asyncio.wait_for(transcription_complete.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    logger.warning("final transcript never finished.")
+            else:
+                logger.info("last event was already completed, skipping wait.")
 
             receive_task.cancel()
             
-
-
             if stream.is_active():
                 stream.stop_stream()
             stream.close()
             pa.terminate()
             logger.info("ended stream")
-
-            
-
 
     def start_listening(self, delta_callback: callable, transcript_callback: callable) -> None:
         """
@@ -183,7 +180,12 @@ class LemonFlow:
         if self.is_listening:
             logger.warning("already listening.")
             return
+        
         ws_port = self._get_ws_port()
+        if ws_port is None:
+            logger.error("could not determine port")
+            return
+
         client = AsyncOpenAI(
             api_key="lemonflow",
             base_url=self.base_url,
@@ -191,9 +193,11 @@ class LemonFlow:
         )
         self.is_listening = True
         logger.info("started listening.")
-        asyncio.run(self._realtime_connection(client, delta_callback, transcript_callback))
+        try:
+            asyncio.run(self._realtime_connection(client, delta_callback, transcript_callback))
+        except KeyboardInterrupt:
+            self.stop_listening()
 
-    
     def stop_listening(self) -> None:
         """
         stops stream
@@ -203,25 +207,19 @@ class LemonFlow:
             return
         logger.info("stopping...")
         self.is_listening = False
-        
-        
 
 def main():
     lemon = LemonFlow()
     
     def on_text_received(text: str) -> None:
-        print(text)
+        if text:
+            print(text)
     
     def on_transcript_received(text: str) -> None:
-        print(f"\n---\n{text}\n---\n\n")
+        if text:
+            print(f"\n\n---\n{text}\n---\n")
 
-    try:
-        lemon.start_listening(delta_callback=on_text_received, transcript_callback=on_transcript_received)
-        while True:
-            time.sleep(0.1)
-
-    except KeyboardInterrupt:
-        lemon.stop_listening()
+    lemon.start_listening(delta_callback=on_text_received, transcript_callback=on_transcript_received)
 
 if __name__ == "__main__":
     main()
