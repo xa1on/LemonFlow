@@ -1,10 +1,5 @@
 import logging
-import asyncio
-import base64
-import json
-import urllib.request
-import numpy as np
-import pyaudio
+from .recorder import Recorder
 from openai import AsyncOpenAI
 
 BASE_URL = "http://localhost:8000/api/v1"
@@ -15,211 +10,19 @@ DEFAULT_MODEL = "Whisper-Tiny"
 logger = logging.getLogger("lemonflow")
 logging.basicConfig(level=logging.INFO)
 
-def downsample_pcm16(pcm16_bytes: bytes, native_rate: int, target_rate: int) -> bytes:
-    """
-    downsample pcm16 from native rate to target rate
-
-    :param pcm16_bytes: raw pcm16 data
-    :param native_rate: original rate
-    :param target_rate: new rate
-    """
-    if native_rate == target_rate:
-        return pcm16_bytes
-    
-    audio_data = np.frombuffer(pcm16_bytes, dtype=np.int16)
-    num_samples = len(audio_data)
-    new_num_samples = int(num_samples * target_rate / native_rate)
-    
-    resampled_audio = np.interp(
-        np.linspace(0, num_samples, new_num_samples, endpoint=False),
-        np.arange(num_samples),
-        audio_data
-    ).astype(np.int16)
-    
-    return resampled_audio.tobytes()
-
 class LemonFlow:
     """
     live speech to text via lemonade realtime api
     streams audio and fires callback on every text delta
 
-    :param self:
-    :param model: speech to text model name
-    :param sample_rate: audio sample rate
-    :param base_url: lemonade api base url
+    
     """
 
-    def __init__(self, model: str=DEFAULT_MODEL, sample_rate: int=SAMPLE_RATE, chunk_size: int=CHUNK_SIZE, base_url=BASE_URL):
-        self.model = model
-        self.sample_rate = sample_rate
-        self.chunk_size = chunk_size
-        self.base_url = base_url
-        self.is_listening = False
-        self._load_model()
-
-    def _load_model(self) -> None:
-        try:
-            req = urllib.request.Request(
-                f"{self.base_url}/load",
-                data=json.dumps({"model_name": self.model}).encode(),
-                headers={"Content-Type": "application/json"}
-            )
-            with urllib.request.urlopen(req, timeout=120) as _:
-                logger.info(f"model loaded: {self.model}")
-        except Exception as e:
-            logger.error(f"error loading model: {e}")
-        
-    def _get_ws_port(self) -> int | None:
-        try:
-            with urllib.request.urlopen(f"{self.base_url}/health", timeout=10) as resp:
-                health = json.loads(resp.read().decode())
-                ws_port = health.get("websocket_port")
-                if not ws_port:
-                    logger.error("server did not provide health")
-                    return None
-                logger.info(f"found websocket port: {ws_port}")
-                return ws_port
-        except Exception as e:
-            logger.error(f"error fetching websocket: {e}")
-            return None
-
-    async def _realtime_connection(self, client: AsyncOpenAI, delta_callback: callable, transcript_callback: callable):
-        logger.info("connecting...")
-
-        async with client.beta.realtime.connect(model=self.model) as conn:
-            event = await asyncio.wait_for(conn.recv(), timeout=15)
-            logger.info(f"session {event.session.id}")
-            self.is_listening = True
-
-            transcription_complete = asyncio.Event()
-            last_event_type = None
-
-            pa = pyaudio.PyAudio()
-            device_info = pa.get_default_input_device_info()
-            native_rate = int(device_info['defaultSampleRate'])
-            
-            stream = pa.open(
-                format=pyaudio.paInt16,
-                channels=1,
-                rate=native_rate,
-                input=True,
-                frames_per_buffer=self.chunk_size
-            )
-            
-            logger.info("recording...")
-
-            async def send_audio():
-                try:
-                    while self.is_listening:
-                        data = await asyncio.to_thread(stream.read, self.chunk_size, exception_on_overflow=False)
-                        data = downsample_pcm16(data, native_rate, self.sample_rate)
-                        
-                        await conn.input_audio_buffer.append(
-                            audio=base64.b64encode(data).decode()
-                        )
-                        await asyncio.sleep(0.01)
-                except asyncio.CancelledError:
-                    pass
-                finally:
-                    if last_event_type != "conversation.item.input_audio_transcription.completed":
-                        logger.info("committing final audio...")
-                        try:
-                            await conn.input_audio_buffer.commit()
-                        except:
-                            pass
-                    self.is_listening = False
-            
-            async def receive_transcriptions():
-                nonlocal last_event_type
-                try:
-                    async for event in conn:
-                        last_event_type = event.type
-                        if event.type == "conversation.item.input_audio_transcription.delta":
-                            delta_callback(getattr(event, "delta", "").replace('\n', ' ').strip())
-                        
-                        elif event.type == "conversation.item.input_audio_transcription.completed":
-                            transcript_callback(getattr(event, "transcript", "").replace('\n', ' ').strip())
-                            if not self.is_listening:
-                                transcription_complete.set()
-                        
-                        elif event.type == "error":
-                            error = getattr(event, "error", None)
-                            msg = getattr(error, "message", "Unknown") if error else "Unknown"
-                            logger.error(f"\nerror: {msg}")
-
-                except asyncio.CancelledError:
-                    pass
-
-            send_task = asyncio.create_task(send_audio())
-            receive_task = asyncio.create_task(receive_transcriptions())
-
-            await send_task
-            logger.info("received stop signal...")
-            send_task.cancel()
-
-            if last_event_type != "conversation.item.input_audio_transcription.completed":
-                try:
-                    await asyncio.wait_for(transcription_complete.wait(), timeout=5.0)
-                except asyncio.TimeoutError:
-                    logger.warning("final transcript never finished.")
-            else:
-                logger.info("last event was already completed, skipping wait.")
-
-            receive_task.cancel()
-            
-            if stream.is_active():
-                stream.stop_stream()
-            stream.close()
-            pa.terminate()
-            logger.info("ended stream")
-
-    def start_listening(self, delta_callback: callable, transcript_callback: callable) -> None:
-        """
-        starts audio stream
-        """
-        if self.is_listening:
-            logger.warning("already listening.")
-            return
-        
-        ws_port = self._get_ws_port()
-        if ws_port is None:
-            logger.error("could not determine port")
-            return
-
-        client = AsyncOpenAI(
-            api_key="lemonflow",
-            base_url=self.base_url,
-            websocket_base_url=f"ws://localhost:{ws_port}"
-        )
-        self.is_listening = True
-        logger.info("started listening.")
-        try:
-            asyncio.run(self._realtime_connection(client, delta_callback, transcript_callback))
-        except KeyboardInterrupt:
-            self.stop_listening()
-
-    def stop_listening(self) -> None:
-        """
-        stops stream
-        """
-        if not self.is_listening:
-            logger.warning("not currently listening.")
-            return
-        logger.info("stopping...")
-        self.is_listening = False
+    def __init__(self):
+        self.recorder = Recorder()
 
 def main():
     lemon = LemonFlow()
-    
-    def on_text_received(text: str) -> None:
-        if text:
-            print(text)
-    
-    def on_transcript_received(text: str) -> None:
-        if text:
-            print(f"\n\n---\n{text}\n---\n")
-
-    lemon.start_listening(delta_callback=on_text_received, transcript_callback=on_transcript_received)
 
 if __name__ == "__main__":
     main()
