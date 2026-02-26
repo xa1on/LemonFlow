@@ -12,8 +12,7 @@ logging.basicConfig(level=logging.INFO)
 
 class LemonFlow:
     """
-    live speech to text via lemonade realtime api
-    streams audio and fires callback on every text delta
+    live speech to text via lemonade realtime api w/ formatting n stuff
 
     
     """

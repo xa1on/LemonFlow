@@ -22,6 +22,7 @@ def downsample_pcm16(pcm16_bytes: bytes, native_rate: int, target_rate: int) -> 
     :param pcm16_bytes: raw pcm16 data
     :param native_rate: original rate
     :param target_rate: new rate
+    :return: downscampled result
     """
     if native_rate == target_rate:
         return pcm16_bytes
@@ -58,6 +59,9 @@ class Recorder:
         self._load_model()
 
     def _load_model(self) -> None:
+        """
+        load whisper.cpp model
+        """
         try:
             req = urllib.request.Request(
                 f"{self.base_url}/load",
@@ -70,6 +74,11 @@ class Recorder:
             logger.error(f"error loading model: {e}")
         
     def _get_ws_port(self) -> int | None:
+        """
+        get websocket port
+
+        :return: websocket port
+        """
         try:
             with urllib.request.urlopen(f"{self.base_url}/health", timeout=10) as resp:
                 health = json.loads(resp.read().decode())
@@ -83,7 +92,14 @@ class Recorder:
             logger.error(f"error fetching websocket: {e}")
             return None
 
-    async def _realtime_connection(self, client: AsyncOpenAI, delta_callback: callable, transcript_callback: callable):
+    async def _realtime_connection(self, client: AsyncOpenAI, delta_callback: callable, transcript_callback: callable) -> None:
+        """
+        initialize async realitime_conection
+
+        :param client: openai client
+        :param delta_callback: callable to call when delta event recieved (first param will be the delta text)
+        :param transcript_callback: callable to call when transcript completed event recieved (first param will be transcript text)
+        """
         logger.info("connecting...")
 
         async with client.beta.realtime.connect(model=self.model) as conn:
@@ -176,6 +192,9 @@ class Recorder:
     def start_listening(self, delta_callback: callable, transcript_callback: callable) -> None:
         """
         starts audio stream
+
+        :param delta_callback: callable to call when delta event recieved (first param will be the delta text)
+        :param transcript_callback: callable to call when transcript completed event recieved (first param will be transcript text)
         """
         if self.is_listening:
             logger.warning("already listening.")
