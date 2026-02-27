@@ -22,7 +22,7 @@ def downsample_pcm16(pcm16_bytes: bytes, native_rate: int, target_rate: int) -> 
     :param pcm16_bytes: raw pcm16 data
     :param native_rate: original rate
     :param target_rate: new rate
-    :return: downscampled result
+    :return: downsampled result
     """
     if native_rate == target_rate:
         return pcm16_bytes
@@ -108,7 +108,7 @@ class Recorder:
             self.is_listening = True
 
             transcription_complete = asyncio.Event()
-            last_event_type = None
+            last_event_type = "conversation.item.input_audio_transcription.completed"
 
             pa = pyaudio.PyAudio()
             device_info = pa.get_default_input_device_info()
@@ -175,7 +175,7 @@ class Recorder:
 
             if last_event_type != "conversation.item.input_audio_transcription.completed":
                 try:
-                    await asyncio.wait_for(transcription_complete.wait(), timeout=5.0)
+                    await asyncio.wait_for(transcription_complete.wait(), timeout=10.0)
                 except asyncio.TimeoutError:
                     logger.warning("final transcript never finished.")
             else:
@@ -228,17 +228,19 @@ class Recorder:
         self.is_listening = False
 
 def main():
-    lemon = Recorder()
+    """
+    example code
+    """
+    recorder = Recorder()
     
-    def on_text_received(text: str) -> None:
-        if text:
-            print(text)
+    def on_text_received(txt: str) -> None:
+        print(txt)
     
-    def on_transcript_received(text: str) -> None:
-        if text:
-            print(f"\n\n---\n{text}\n---\n")
+    def on_transcript_received(txt: str) -> None:
+        if txt:
+            print(f"\n\n---\n{txt}\n---\n")
 
-    lemon.start_listening(delta_callback=on_text_received, transcript_callback=on_transcript_received)
+    recorder.start_listening(delta_callback=on_text_received, transcript_callback=on_transcript_received)
 
 if __name__ == "__main__":
     main()
