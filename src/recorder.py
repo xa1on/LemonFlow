@@ -10,7 +10,7 @@ from openai import AsyncOpenAI
 BASE_URL = "http://localhost:8000/api/v1"
 SAMPLE_RATE = 16000
 CHUNK_SIZE = 4096
-DEFAULT_MODEL = "Whisper-Tiny"
+DEFAULT_MODEL = "Whisper-Base"
 
 logger = logging.getLogger("recorder")
 logging.basicConfig(level=logging.INFO)
