@@ -13,7 +13,7 @@ BASE_URL = "http://localhost:8000/api/v1"
 SAMPLE_RATE = 16000
 CHUNK_SIZE = 4096
 DEFAULT_MODEL = "Whisper-Base"
-BUFFER_SECONDS = 0.5
+BUFFER_SECONDS = 4.0
 
 logger = logging.getLogger("recorder")
 logging.basicConfig(level=logging.INFO)
@@ -61,7 +61,10 @@ class Recorder:
         self.is_listening = False
         
         # buffering system
-        self._buffer = collections.deque(maxlen=int(SAMPLE_RATE * BUFFER_SECONDS / chunk_size) + 1)
+        # ensure buffer can hold at least BUFFER_SECONDS even with high native sample rates
+        # (native_rate/sample_rate) more chunks are needed because resampled chunks are smaller
+        # we use a conservative multiplier of 4 to cover up to 64khz native rate
+        self._buffer = collections.deque(maxlen=int(SAMPLE_RATE * BUFFER_SECONDS / chunk_size * 4) + 10)
         self._stream_active = True
         self._audio_thread = threading.Thread(target=self._capture_audio, daemon=True)
         self._audio_thread.start()
@@ -145,9 +148,27 @@ class Recorder:
         logger.info("connecting...")
 
         async with client.beta.realtime.connect(model=self.model) as conn:
-            event = await asyncio.wait_for(conn.recv(), timeout=15)
-            logger.info(f"session {event.session.id}")
-            self.is_listening = True
+            try:
+                event = await asyncio.wait_for(conn.recv(), timeout=15)
+                session_id = getattr(event.session, "id", "unknown") if hasattr(event, "session") else "unknown"
+                logger.info(f"connected to session: {session_id}")
+            except Exception as e:
+                logger.error(f"initial connection failed: {e}")
+                return
+
+            if not self.is_listening:
+                logger.info("stop signal received during connection phase")
+                return
+
+            # ensure transcription is enabled for the session
+            try:
+                await conn.session.update(session={
+                    "input_audio_transcription": {"model": "whisper-1"},
+                    "turn_detection": {"type": "server_vad"}
+                })
+                logger.info("session configured for continuous transcription")
+            except Exception as e:
+                logger.warning(f"could not update session config (might be a simplified server): {e}")
 
             transcription_complete = asyncio.Event()
             last_event_type = "conversation.item.input_audio_transcription.completed"
@@ -155,6 +176,7 @@ class Recorder:
             logger.info("streaming buffered audio...")
 
             async def send_audio():
+                nonlocal last_event_type
                 try:
                     # send buffered data first
                     while len(self._buffer) > 0:
@@ -162,6 +184,11 @@ class Recorder:
                         await conn.input_audio_buffer.append(
                             audio=base64.b64encode(data).decode()
                         )
+                        # yield control to avoid blocking during burst
+                        await asyncio.sleep(0)
+
+                    # small pause after burst to let server process the initial segment
+                    await asyncio.sleep(0.1)
 
                     # continue streaming live data
                     while self.is_listening:
@@ -170,9 +197,17 @@ class Recorder:
                             await conn.input_audio_buffer.append(
                                 audio=base64.b64encode(data).decode()
                             )
-                        await asyncio.sleep(0.01)
-                except asyncio.CancelledError:
-                    pass
+                        else:
+                            await asyncio.sleep(0.02)
+                    
+                    # flush remaining chunks
+                    while len(self._buffer) > 0:
+                        data = self._buffer.popleft()
+                        await conn.input_audio_buffer.append(
+                            audio=base64.b64encode(data).decode()
+                        )
+                except Exception as e:
+                    logger.error(f"send_audio error: {e}")
                 finally:
                     if last_event_type != "conversation.item.input_audio_transcription.completed":
                         logger.info("committing final audio...")
@@ -198,10 +233,12 @@ class Recorder:
                         elif event.type == "error":
                             error = getattr(event, "error", None)
                             msg = getattr(error, "message", "Unknown") if error else "Unknown"
-                            logger.error(f"\nerror: {msg}")
+                            logger.error(f"server error: {msg}")
 
                 except asyncio.CancelledError:
                     pass
+                except Exception as e:
+                    logger.error(f"receive_transcriptions error: {e}")
 
             send_task = asyncio.create_task(send_audio())
             receive_task = asyncio.create_task(receive_transcriptions())
@@ -215,9 +252,7 @@ class Recorder:
                     await asyncio.wait_for(transcription_complete.wait(), timeout=10.0)
                 except asyncio.TimeoutError:
                     logger.warning("final transcript never finished.")
-            else:
-                logger.info("last event was already completed, skipping wait.")
-
+            
             receive_task.cancel()
             logger.info("ended stream")
 
