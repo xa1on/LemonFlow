@@ -101,7 +101,8 @@ def main():
             time.sleep(0.1)
     except KeyboardInterrupt:
         logger.info("shutting down...")
-        lemon.stop_listening()
+        if lemon.recorder.is_listening:
+            lemon.stop_listening()
         listener.stop()
 
 if __name__ == "__main__":

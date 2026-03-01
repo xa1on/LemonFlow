@@ -5,12 +5,15 @@ import json
 import urllib.request
 import numpy as np
 import pyaudio
+import threading
+import collections
 from openai import AsyncOpenAI
 
 BASE_URL = "http://localhost:8000/api/v1"
 SAMPLE_RATE = 16000
 CHUNK_SIZE = 4096
 DEFAULT_MODEL = "Whisper-Base"
+BUFFER_SECONDS = 0.5
 
 logger = logging.getLogger("recorder")
 logging.basicConfig(level=logging.INFO)
@@ -56,7 +59,46 @@ class Recorder:
         self.chunk_size = chunk_size
         self.base_url = base_url
         self.is_listening = False
+        
+        # buffering system
+        self._buffer = collections.deque(maxlen=int(SAMPLE_RATE * BUFFER_SECONDS / chunk_size) + 1)
+        self._stream_active = True
+        self._audio_thread = threading.Thread(target=self._capture_audio, daemon=True)
+        self._audio_thread.start()
+        
         self._load_model()
+
+    def _capture_audio(self) -> None:
+        """
+        continuously capture audio into a circular buffer
+        """
+        pa = pyaudio.PyAudio()
+        try:
+            device_info = pa.get_default_input_device_info()
+            native_rate = int(device_info['defaultSampleRate'])
+            
+            stream = pa.open(
+                format=pyaudio.paInt16,
+                channels=1,
+                rate=native_rate,
+                input=True,
+                frames_per_buffer=self.chunk_size
+            )
+            
+            logger.info("audio hardware initialized and buffering")
+            
+            while self._stream_active:
+                data = stream.read(self.chunk_size, exception_on_overflow=False)
+                data = downsample_pcm16(data, native_rate, self.sample_rate)
+                self._buffer.append(data)
+                
+        except Exception as e:
+            logger.error(f"audio capture error: {e}")
+        finally:
+            if 'stream' in locals():
+                stream.stop_stream()
+                stream.close()
+            pa.terminate()
 
     def _load_model(self) -> None:
         """
@@ -110,29 +152,24 @@ class Recorder:
             transcription_complete = asyncio.Event()
             last_event_type = "conversation.item.input_audio_transcription.completed"
 
-            pa = pyaudio.PyAudio()
-            device_info = pa.get_default_input_device_info()
-            native_rate = int(device_info['defaultSampleRate'])
-            
-            stream = pa.open(
-                format=pyaudio.paInt16,
-                channels=1,
-                rate=native_rate,
-                input=True,
-                frames_per_buffer=self.chunk_size
-            )
-            
-            logger.info("recording...")
+            logger.info("streaming buffered audio...")
 
             async def send_audio():
                 try:
-                    while self.is_listening:
-                        data = await asyncio.to_thread(stream.read, self.chunk_size, exception_on_overflow=False)
-                        data = downsample_pcm16(data, native_rate, self.sample_rate)
-                        
+                    # send buffered data first
+                    while len(self._buffer) > 0:
+                        data = self._buffer.popleft()
                         await conn.input_audio_buffer.append(
                             audio=base64.b64encode(data).decode()
                         )
+
+                    # continue streaming live data
+                    while self.is_listening:
+                        if len(self._buffer) > 0:
+                            data = self._buffer.popleft()
+                            await conn.input_audio_buffer.append(
+                                audio=base64.b64encode(data).decode()
+                            )
                         await asyncio.sleep(0.01)
                 except asyncio.CancelledError:
                     pass
@@ -182,11 +219,6 @@ class Recorder:
                 logger.info("last event was already completed, skipping wait.")
 
             receive_task.cancel()
-            
-            if stream.is_active():
-                stream.stop_stream()
-            stream.close()
-            pa.terminate()
             logger.info("ended stream")
 
     def start_listening(self, delta_callback: callable, transcript_callback: callable) -> None:
