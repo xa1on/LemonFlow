@@ -10,10 +10,11 @@ live speech to text recording and transcription via [lemonade-sdk](https://githu
 
 ## TODO
 
-- [ ] string together results to create one unified script
+- [x] string together results to create one unified script
 - [ ] fancy local mini llm formatting (maybe in markdown or other formats)
-- [ ] autocorrect punctuation and grammer
-- [ ] dictionary to reference alternate words for specific pronounciations
+    - [x] formatting class to manage formatting
+- [x] autocorrect punctuation and grammer
+- [ ] dictionary to reference alternate words for specific pronounciations (maybe?)
 - [ ] actually type out the stuff being transcribed via keyboard library
     - [ ] probably include a keybind for hold to activate
 - [ ] turn into actual python package and distribute via pip?

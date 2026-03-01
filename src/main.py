@@ -4,6 +4,7 @@ import logging
 import threading
 
 from .recorder import Recorder
+from .formatter import Formatter
 
 from pynput import keyboard
 
@@ -19,6 +20,7 @@ class LemonFlowScribe:
 
     def __init__(self):
         self.recorder = Recorder()
+        self.formatter = Formatter()
 
     def start_listening(self, output_file_path: str):
         """
@@ -67,7 +69,7 @@ def main():
     def on_release_callback():
         lemon.stop_listening()
 
-    combination = set(keyboard.HotKey.parse(SCRIBE_KEYBIND))
+    combination = set(keyboard.HotKey.parse(SCRIBE_KEYBIND)) # setting up keybind
     current_keys = set()
 
     def on_p(key):
