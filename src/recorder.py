@@ -1,5 +1,6 @@
 import logging
 import asyncio
+import inspect
 import base64
 import json
 import urllib.request
@@ -223,10 +224,19 @@ class Recorder:
                     async for event in conn:
                         last_event_type = event.type
                         if event.type == "conversation.item.input_audio_transcription.delta":
-                            delta_callback(getattr(event, "delta", "").replace('\n', ' ').strip())
+                            text = getattr(event, "delta", "").replace('\n', ' ').strip()
+                            if inspect.iscoroutinefunction(delta_callback):
+                                await delta_callback(text)
+                            else:
+                                delta_callback(text)
                         
                         elif event.type == "conversation.item.input_audio_transcription.completed":
-                            transcript_callback(getattr(event, "transcript", "").replace('\n', ' ').strip())
+                            text = getattr(event, "transcript", "").replace('\n', ' ').strip()
+                            if inspect.iscoroutinefunction(transcript_callback):
+                                await transcript_callback(text)
+                            else:
+                                transcript_callback(text)
+                            
                             if not self.is_listening:
                                 transcription_complete.set()
                         
@@ -256,7 +266,7 @@ class Recorder:
             receive_task.cancel()
             logger.info("ended stream")
 
-    def start_listening(self, delta_callback: callable, transcript_callback: callable) -> None:
+    async def start_listening(self, delta_callback: callable, transcript_callback: callable) -> None:
         """
         starts audio stream
 
@@ -279,10 +289,7 @@ class Recorder:
         )
         self.is_listening = True
         logger.info("started listening.")
-        try:
-            asyncio.run(self._realtime_connection(client, delta_callback, transcript_callback))
-        except KeyboardInterrupt:
-            self.stop_listening()
+        await self._realtime_connection(client, delta_callback, transcript_callback)
 
     def stop_listening(self) -> None:
         """
@@ -300,10 +307,10 @@ def main():
     """
     recorder = Recorder()
     
-    def on_text_received(txt: str) -> None:
-        print(txt)
+    async def on_text_received(txt: str) -> None:
+        print(txt, end="\r", flush=True)
     
-    def on_transcript_received(txt: str) -> None:
+    async def on_transcript_received(txt: str) -> None:
         if txt:
             print(f"\n\n---\n{txt}\n---\n")
 
