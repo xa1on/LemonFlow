@@ -249,7 +249,7 @@ class Recorder:
 
             if last_event_type != "conversation.item.input_audio_transcription.completed":
                 try:
-                    await asyncio.wait_for(transcription_complete.wait(), timeout=10.0)
+                    await asyncio.wait_for(transcription_complete.wait(), timeout=15.0)
                 except asyncio.TimeoutError:
                     logger.warning("final transcript never finished.")
             

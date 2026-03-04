@@ -36,7 +36,8 @@ class Formatter:
             model=MODEL,
             messages=[
                 {"role": "system", "content": SYS_PROMPT},
-                {"role": "user", "content": f"User: {text}\nResponse: "}
+                {"role": "user", "content": text}
             ]
         )
-        return completion.choices[0].text
+        return completion.choices[0].message.content
+
